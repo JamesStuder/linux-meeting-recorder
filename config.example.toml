@@ -1,0 +1,35 @@
+# ~/.config/meeting-recorder/config.toml
+# Every key is optional; these are the defaults.
+
+output_dir = "~/Videos/Meetings"
+countdown = 10          # seconds to Skip / pick a screen when a meeting starts
+end_grace = 5           # the meeting's mic stream has been gone this long = meeting over
+min_length = 60         # shorter recordings are deleted (mic tests, accidental starts)
+fps = 15
+quality = "medium"      # gpu-screen-recorder quality: medium, high, very_high, ultra
+join_size = "1920x1080" # frame size when a recording used several screens
+fallback_screen = ""    # e.g. "DP-1"; used when the meeting window can't be found ("" = first screen)
+
+# Which apps count as meetings: label = regex on the PipeWire client's binary / application name.
+# (Setting this table replaces the whole default list.)
+[apps]
+Teams = "teams-for-linux|teams"
+Zoom = "^zoom|zoom voiceengine|zoomwebviewhost"
+Browser = "chrome|chromium|brave|firefox|msedge|vivaldi|opera"
+
+# Optional: prefix titles with a profile name taken from the meeting app's command line,
+# handy if you run several copies/profiles of one app. One capture group.
+# profile_from_cmdline = "--user-data-dir=\\S*teams-(\\w+)"
+
+# Optional: run a command automatically after every saved recording.
+# Placeholders: {folder} {audio} {video} {json} {title}
+# on_saved = "notify-send 'Saved' {title}"
+
+# Optional: up to two buttons on the "Meeting saved" notification.
+# [[actions]]
+# label = "Upload"
+# command = "my-upload-script {audio} {json}"
+#
+# [[actions]]
+# label = "Transcribe"
+# command = "whisper {audio} --output_dir {folder}"

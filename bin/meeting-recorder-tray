@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""meeting-recorder-tray: always-on tray icon + notes window for meeting-recorder.
+
+Idle: grey record icon; click = start recording, menu = Start / Open recordings folder.
+Recording: red icon; click = notes window, menu = Notes / Stop / Open folder.
+
+The recorder writes a state file while recording:
+  {"title", "start" (ISO time), "notes" (jsonl path), "stop_file", "folder"}
+Each note is appended to the jsonl file as soon as it is added, timestamped
+from the moment you started typing it (so it lines up with what was said).
+When the recording stops, the recorder asks (flush flag) for any half-typed
+note to be saved before it collects the notes.
+"""
+import json, os, signal, subprocess, sys
+from datetime import datetime
+from pathlib import Path
+
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QAction, QIcon, QKeyEvent
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QHBoxLayout, QLabel, QListWidget,
+                             QMenu, QPlainTextEdit, QPushButton, QSystemTrayIcon,
+                             QVBoxLayout, QWidget)
+
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+STATE_FILE = RUNTIME / "meeting-recorder.state.json"
+STOP_FILE = RUNTIME / "meeting-recorder.stop"
+START_FILE = RUNTIME / "meeting-recorder.start"
+NOTES_FLAG = RUNTIME / "meeting-recorder.shownotes"
+FLUSH_FLAG = RUNTIME / "meeting-recorder.flushnotes"
+RECORDER = str(Path(__file__).resolve().with_name("meeting-recorder"))
+
+
+def output_dir():
+    """Recordings folder from the recorder's config (same default)."""
+    import tomllib
+    cfg = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "meeting-recorder" / "config.toml"
+    try:
+        with open(cfg, "rb") as f:
+            return Path(os.path.expanduser(tomllib.load(f).get("output_dir", "~/Videos/Meetings")))
+    except (OSError, ValueError):
+        return Path.home() / "Videos" / "Meetings"
+
+
+OUT_DIR = output_dir()
+
+
+def screens():
+    """[(output, label)] like the recorder's screen buttons."""
+    try:
+        out = subprocess.run(["gpu-screen-recorder", "--list-monitors"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except Exception:
+        return []
+    res, used = [], set()
+    for line in out.splitlines():
+        name, _, size = line.partition("|")
+        if "x" not in size or not size.split("x")[0].isdigit():
+            continue
+        w, h = map(int, size.split("x")[:2])
+        label = "Laptop" if name.startswith("eDP") else "Portrait monitor" if h > w else \
+            "4K monitor" if w >= 3840 else f"{w}x{h} monitor"
+        if label in used:
+            label = f"{label} ({name})"
+        used.add(label)
+        res.append((name, label))
+    return res
+
+
+def fmt(secs):
+    return f"{secs // 3600:02d}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
+
+
+class NoteBox(QPlainTextEdit):
+    """Enter adds the note, Shift+Enter makes a new line."""
+
+    def __init__(self, on_submit):
+        super().__init__()
+        self.on_submit = on_submit
+        self.started = None
+        self.setPlaceholderText("Type a note, press Enter to save (Shift+Enter = new line)")
+        self.setFixedHeight(70)
+        self.textChanged.connect(self._mark_start)
+
+    def _mark_start(self):
+        if self.toPlainText().strip() and self.started is None:
+            self.started = datetime.now()
+        elif not self.toPlainText().strip():
+            self.started = None
+
+    def keyPressEvent(self, e: QKeyEvent):
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self.submit()
+        else:
+            super().keyPressEvent(e)
+
+    def submit(self):
+        text = self.toPlainText().strip()
+        if text:
+            self.on_submit(text, self.started or datetime.now())
+        self.clear()
+        self.started = None
+
+
+class NotesWindow(QWidget):
+    """Notes for one recording (a new window per recording)."""
+
+    def __init__(self, state):
+        super().__init__()
+        self.state = state
+        self.start = datetime.fromisoformat(state["start"]).astimezone().replace(tzinfo=None)
+        self.notes = Path(state["notes"])
+        self.setWindowTitle(f"Meeting notes — {state['title']}")
+        self.setWindowIcon(QIcon.fromTheme("media-record"))
+        self.resize(460, 380)
+        self.clock = QLabel()
+        self.list = QListWidget()
+        self.list.setWordWrap(True)
+        self.box = NoteBox(self.add_note)
+        add = QPushButton("Add note")
+        add.clicked.connect(self.box.submit)
+        self.on_top = QCheckBox("Keep on top")
+        self.on_top.setChecked(True)
+        self.on_top.toggled.connect(self.set_on_top)
+        row = QHBoxLayout()
+        row.addWidget(self.on_top)
+        row.addStretch()
+        row.addWidget(add)
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.clock)
+        lay.addWidget(self.list)
+        lay.addWidget(self.box)
+        lay.addLayout(row)
+        self.set_on_top(True)
+        if self.notes.exists():
+            for l in self.notes.read_text().splitlines():
+                if l.strip():
+                    n = json.loads(l)
+                    self.list.addItem(f"[{n['at']}]  {n['text']}")
+
+    def elapsed(self, at=None):
+        s = max(0, int(((at or datetime.now()) - self.start).total_seconds()))
+        return fmt(s), s
+
+    def set_on_top(self, on):
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+        if self.isVisible():
+            self.show()
+
+    def add_note(self, text, at):
+        stamp, secs = self.elapsed(at)
+        note = {"at": stamp, "seconds": secs, "time": at.strftime("%H:%M:%S"), "text": text}
+        with self.notes.open("a") as f:
+            f.write(json.dumps(note) + "\n")
+        self.list.addItem(f"[{stamp}]  {text}")
+        self.list.scrollToBottom()
+
+    def flush(self):
+        """Save anything still typed in the box (when the recording ends)."""
+        self.box.submit()
+
+    def open(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.box.setFocus()
+
+    def toggle(self):
+        self.hide() if self.isVisible() else self.open()
+
+
+class Tray:
+    def __init__(self):
+        self.win = None
+        self.state_mtime = None
+        self.screen_list = []
+        red = QIcon.fromTheme("media-record")
+        self.icon_rec = red
+        self.icon_idle = QIcon(red.pixmap(64, QIcon.Mode.Disabled))
+        self.tray = QSystemTrayIcon(self.icon_idle)
+        self.menu = QMenu()
+        self.tray.setContextMenu(self.menu)
+        self.tray.activated.connect(self.clicked)
+        self.build_menu()
+        self.tray.show()
+
+    def recording(self):
+        return self.win is not None
+
+    def build_menu(self):
+        self.menu.clear()
+        items = ([("Notes…", "document-edit", lambda: self.win.open()),
+                  ("Stop recording", "media-playback-stop", lambda: STOP_FILE.touch())]
+                 if self.recording() else
+                 [("Start recording", "media-record", lambda: START_FILE.touch())])
+        if self.recording():
+            sub = self.menu.addMenu(QIcon.fromTheme("video-display"), "Screen")
+            current = self.win.state.get("screen")
+            for name, label in self.screen_list:
+                a = QAction(label, sub)
+                a.setCheckable(True)
+                a.setChecked(name == current)
+                a.triggered.connect(lambda _=False, n=name: subprocess.Popen([RECORDER, "screen", n]))
+                sub.addAction(a)
+        items.append(("Open recordings folder", "folder-videos",
+                      lambda: subprocess.Popen(["xdg-open", str(OUT_DIR)])))
+        for label, icon, fn in items:
+            a = QAction(QIcon.fromTheme(icon), label, self.menu)
+            a.triggered.connect(fn)
+            self.menu.addAction(a)
+
+    def clicked(self, reason):
+        if reason != QSystemTrayIcon.ActivationReason.Trigger:
+            return
+        if self.recording():
+            self.win.toggle()
+        else:
+            START_FILE.touch()
+
+    def begin(self, state):
+        self.screen_list = screens()
+        self.win = NotesWindow(state)
+        self.tray.setIcon(self.icon_rec)
+        self.build_menu()
+
+    def end(self):
+        if self.win:
+            self.win.flush()
+            self.win.close()
+            self.win.deleteLater()
+        self.win = None
+        self.tray.setIcon(self.icon_idle)
+        self.build_menu()
+
+    def tick(self):
+        # recording started / ended?
+        try:
+            mtime = STATE_FILE.stat().st_mtime
+        except FileNotFoundError:
+            mtime = None
+        if mtime != self.state_mtime:
+            self.state_mtime = mtime
+            try:
+                new = json.loads(STATE_FILE.read_text()) if mtime is not None else None
+            except (OSError, ValueError):
+                new, self.state_mtime = None, None    # half-written; retry next tick
+                return
+            if self.win and new and new.get("notes") == self.win.state.get("notes"):
+                self.win.state = new                  # same recording, e.g. screen changed
+                self.build_menu()
+            else:
+                if self.win:
+                    self.end()
+                if new:
+                    try:
+                        self.begin(new)
+                    except (OSError, ValueError, KeyError):
+                        self.state_mtime = None
+        if FLUSH_FLAG.exists():                 # recorder is stopping: save half-typed note
+            if self.win:
+                self.win.flush()
+            FLUSH_FLAG.unlink(missing_ok=True)
+        if NOTES_FLAG.exists():                 # "meeting-recorder notes" (Stream Deck button)
+            NOTES_FLAG.unlink(missing_ok=True)
+            if self.win:
+                self.win.open()
+        if self.win:
+            stamp, _ = self.win.elapsed()
+            self.tray.setToolTip(f"Recording {stamp}\n{self.win.state['title']}\nClick for notes")
+            self.win.clock.setText(f"● Recording  {stamp}   —   notes: {self.win.list.count()}")
+        else:
+            self.tray.setToolTip("Meeting Recorder — not recording\nClick to start recording, right-click for menu")
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("Meeting Recorder")
+    app.setDesktopFileName("meeting-recorder")
+    app.setQuitOnLastWindowClosed(False)
+    tray = Tray()
+    timer = QTimer()
+    timer.timeout.connect(tray.tick)
+    timer.start(500)
+    tray.tick()
+
+    def quit_(*_):
+        if tray.win:
+            tray.win.flush()
+        app.quit()
+    signal.signal(signal.SIGTERM, quit_)
+    signal.signal(signal.SIGINT, quit_)
+    keep = QTimer()                              # let Python see signals while Qt runs
+    keep.timeout.connect(lambda: None)
+    keep.start(300)
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

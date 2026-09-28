@@ -1,0 +1,14 @@
+[Unit]
+Description=Meeting recorder (records your side of online meetings)
+After=graphical-session.target pipewire-pulse.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/meeting-recorder
+KillSignal=SIGTERM
+TimeoutStopSec=40
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

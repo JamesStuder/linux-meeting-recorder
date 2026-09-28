@@ -1,0 +1,12 @@
+[Unit]
+Description=Meeting recorder tray icon (start/stop, screen, notes)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/meeting-recorder-tray
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

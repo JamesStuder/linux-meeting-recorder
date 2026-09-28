@@ -1,0 +1,735 @@
+#!/usr/bin/env python3
+"""meeting-recorder: record your own side of online meetings, no bot in the call.
+
+Watches PipeWire for a meeting app (Teams, Zoom, a browser, ...) opening a
+microphone. A notification offers Skip or a choice of screen, then the meeting's
+screen + your mic + the meeting audio are recorded. Recording follows that
+meeting's own audio stream: it stops a few seconds after the stream closes, and
+jumping straight into another meeting starts a new recording immediately.
+
+Audio is recorded continuously (ffmpeg); video is recorded in pieces, one per
+screen (gpu-screen-recorder), so the screen can be changed mid-meeting. After the
+meeting the pieces are joined into <name>.mp4, with <name>.m4a (audio only) and
+<name>.json (title, duration, timestamped notes) next to it, one folder per
+recording.
+
+Usage:
+  meeting-recorder                        run the watcher (meeting-recorder.service)
+  meeting-recorder start                  start recording now (stops only via stop)
+  meeting-recorder stop                   stop the current recording
+  meeting-recorder notes                  open the notes window (meeting-recorder-tray)
+  meeting-recorder screen <name|next>     record another screen from now on
+  meeting-recorder finalize <folder>      build .m4a/.json/.mp4 from a finished recording
+
+Configuration: ~/.config/meeting-recorder/config.toml (see config.example.toml).
+"""
+import json, os, re, shlex, shutil, signal, subprocess, sys, tempfile, threading, time, tomllib
+from datetime import datetime
+from pathlib import Path
+
+# ---- configuration ----------------------------------------------------------------------
+CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "meeting-recorder" / "config.toml"
+DEFAULTS = {
+    "output_dir": "~/Videos/Meetings",
+    "countdown": 10,          # seconds to click Skip / pick a screen when a meeting starts
+    "end_grace": 5,           # meeting's mic stream gone this long = meeting over
+    "min_length": 60,         # shorter recordings are deleted (mic tests etc.)
+    "fps": 15,
+    "quality": "medium",      # gpu-screen-recorder -q
+    "join_size": "1920x1080", # frame size when joining pieces from different screens
+    "fallback_screen": "",    # used when the meeting window can't be found ("" = first screen)
+    "apps": {                 # label = regex on the PipeWire client's binary / application name
+        "Teams": r"teams-for-linux|teams",
+        "Zoom": r"^zoom|zoom voiceengine|zoomwebviewhost",
+        "Browser": r"chrome|chromium|brave|firefox|msedge|vivaldi|opera",
+    },
+    "ignore": r"gpu-screen-recorder|pavucontrol|plasmashell|kmix|pw-|ffmpeg|obs",
+    # Optional: regex with one group, matched against the meeting app's command lines
+    # (and its parents'); the match is prefixed to the title. Useful when running
+    # several profiles of one app, e.g.  profile_from_cmdline = "--user-data-dir=\\S*teams-(\\w+)"
+    "profile_from_cmdline": "",
+    "actions": [],            # [{label, command}] buttons on the "Meeting saved" notification
+    "on_saved": "",           # command run automatically after each recording is saved
+}
+
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULTS))
+    try:
+        with open(CONFIG_FILE, "rb") as f:
+            user = tomllib.load(f)
+    except FileNotFoundError:
+        user = {}
+    except tomllib.TOMLDecodeError as e:
+        print(f"config error in {CONFIG_FILE}: {e}", file=sys.stderr)
+        user = {}
+    for k, v in user.items():
+        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+            cfg[k] = v
+        else:
+            cfg[k] = v
+    return cfg
+
+
+CFG = load_config()
+OUT_DIR = Path(os.path.expanduser(CFG["output_dir"]))
+POLL = 1
+FPS = str(CFG["fps"])
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+STOP_FILE = RUNTIME / "meeting-recorder.stop"
+STATE_FILE = RUNTIME / "meeting-recorder.state.json"
+START_FILE = RUNTIME / "meeting-recorder.start"
+NOTES_FLAG = RUNTIME / "meeting-recorder.shownotes"
+FLUSH_FLAG = RUNTIME / "meeting-recorder.flushnotes"   # tray saves a half-typed note
+DISCARD_FILE = RUNTIME / "meeting-recorder.discard"     # "Skip" on an auto-switched recording
+SCREEN_FILE = RUNTIME / "meeting-recorder.screen"       # change the recorded screen (name or "next")
+SELF = str(Path(__file__).resolve())
+
+
+def log(*a):
+    print(datetime.now().strftime("%H:%M:%S"), *a, flush=True)
+
+
+def pactl_json(*args):
+    try:
+        return json.loads(subprocess.run(["pactl", "-f", "json", "list", *args],
+                                         capture_output=True, text=True, timeout=5).stdout or "[]")
+    except Exception:
+        return []
+
+
+# ---- meeting detection --------------------------------------------------------------------
+def find_meeting_streams():
+    """Every meeting-app stream currently capturing a real microphone.
+
+    Each call/meeting opens its own PipeWire stream, so `index` identifies the meeting."""
+    found = []
+    sources = {s["index"]: s["name"] for s in pactl_json("sources")}
+    for o in pactl_json("source-outputs"):
+        p = o.get("properties", {})
+        src = sources.get(o.get("source"), "")
+        if not src or src.endswith(".monitor"):
+            continue
+        ident = " ".join(filter(None, [p.get("application.process.binary"),
+                                        p.get("application.name")])).lower()
+        if not ident or re.search(CFG["ignore"], ident):
+            continue
+        for label, rx in CFG["apps"].items():
+            if re.search(rx, ident):
+                pid = int(p.get("application.process.id") or 0)
+                found.append({"app": label, "pid": pid, "mic": src, "index": o.get("index"),
+                              "binary": p.get("application.process.binary", "")})
+                break
+    return found
+
+
+def output_monitor_for(binary):
+    """Monitor source of the sink the meeting app plays to (default sink otherwise)."""
+    sinks = {s["index"]: s["name"] for s in pactl_json("sinks")}
+    for i in pactl_json("sink-inputs"):
+        p = i.get("properties", {})
+        if binary and p.get("application.process.binary") == binary:
+            name = sinks.get(i.get("sink"))
+            if name:
+                return name + ".monitor"
+    default = subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True).stdout.strip()
+    return default + ".monitor"
+
+
+def ancestors(pid):
+    chain = []
+    while pid > 1 and len(chain) < 20:
+        chain.append(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat.rsplit(")", 1)[1].split()[1])
+        except Exception:
+            break
+    return chain
+
+
+def profile_name(pid):
+    rx = CFG.get("profile_from_cmdline")
+    if not rx:
+        return None
+    for p in ancestors(pid):
+        try:
+            cmd = Path(f"/proc/{p}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="ignore")
+        except Exception:
+            continue
+        m = re.search(rx, cmd)
+        if m:
+            return (m.group(1) if m.groups() else m.group(0)).upper()
+    return None
+
+
+# ---- windows and screens (KDE Plasma / KWin) ----------------------------------------------
+def kwin_windows():
+    """[(pid, output, resourceClass, caption, active)] for normal windows, via a one-shot KWin script.
+
+    The script prints to the journal, which is where KWin script output ends up on Plasma."""
+    js = ('var ws=workspace.windowList();for(var i=0;i<ws.length;i++){var w=ws[i];'
+          'if(!w.normalWindow)continue;print("MEETREC|"+w.pid+"|"+(w.output?w.output.name:"")'
+          '+"|"+w.resourceClass+"|"+(w===workspace.activeWindow?"1":"0")+"|"+w.caption);}')
+    qdbus = shutil.which("qdbus6") or shutil.which("qdbus")
+    if not qdbus:
+        return []
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+        f.write(js)
+        path = f.name
+    since = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    q = [qdbus, "org.kde.KWin"]
+    try:
+        sid = subprocess.run(q + ["/Scripting", "org.kde.kwin.Scripting.loadScript", path, "meetrec"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        subprocess.run(q + [f"/Scripting/Script{sid}", "org.kde.kwin.Script.run"], capture_output=True, timeout=5)
+        time.sleep(0.7)
+        subprocess.run(q + ["/Scripting", "org.kde.kwin.Scripting.unloadScript", "meetrec"],
+                       capture_output=True, timeout=5)
+        out = subprocess.run(["journalctl", "--user", "--since", since, "-o", "cat", "--no-pager"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return []
+    finally:
+        os.unlink(path)
+    wins = []
+    for line in out.splitlines():
+        if line.startswith("MEETREC|"):
+            parts = line.split("|", 5)
+            if len(parts) == 6 and parts[1].isdigit():
+                wins.append((int(parts[1]), parts[2], parts[3], parts[5], parts[4] == "1"))
+    return wins
+
+
+def screens():
+    """[(output name, friendly label)] from gpu-screen-recorder's monitor list."""
+    try:
+        out = subprocess.run(["gpu-screen-recorder", "--list-monitors"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except Exception:
+        return []
+    result, used = [], set()
+    for line in out.splitlines():
+        name, _, size = line.partition("|")
+        if not re.fullmatch(r"\d+x\d+", size):
+            continue
+        w, h = map(int, size.split("x"))
+        if name.startswith(("eDP", "LVDS", "DSI")):
+            label = "Laptop"
+        elif h > w:
+            label = "Portrait monitor"
+        elif w >= 3840:
+            label = "4K monitor"
+        else:
+            label = f"{w}x{h} monitor"
+        if label in used:
+            label = f"{label} ({name})"
+        used.add(label)
+        result.append((name, label))
+    return result
+
+
+def fallback_screen():
+    names = [n for n, _ in screens()]
+    if CFG["fallback_screen"] in names:
+        return CFG["fallback_screen"]
+    return names[0] if names else "screen"
+
+
+def screen_label(name):
+    return dict(screens()).get(name, name)
+
+
+def active_screen():
+    for w in kwin_windows():
+        if w[4] and w[1]:
+            return w[1]
+    return fallback_screen()
+
+
+def manual_stream():
+    mic = subprocess.run(["pactl", "get-default-source"], capture_output=True, text=True).stdout.strip()
+    return {"app": "Manual", "pid": 0, "mic": mic or "default_input", "binary": "", "manual": True}
+
+
+def meeting_window(stream):
+    """The meeting's window: (screen, caption)."""
+    chain = set(ancestors(stream["pid"]))
+    wins = [w for w in kwin_windows() if w[0] in chain]
+    if not wins:
+        return fallback_screen(), None
+    hint = re.compile(r"meet|meeting|call|zoom|webex|teams", re.I)
+    wins.sort(key=lambda w: (not hint.search(w[3]), len(w[3])))
+    return wins[0][1] or fallback_screen(), wins[0][3]
+
+
+# ---- notifications ------------------------------------------------------------------------
+def notify(summary, body, actions=(), timeout=None, icon="media-record"):
+    """Show a notification; returns a Popen so the caller can wait for the chosen action."""
+    cmd = ["notify-send", "-a", "Meeting Recorder", "-i", icon, summary, body]
+    if timeout is not None:
+        cmd += ["-t", str(timeout * 1000)]
+    for key, label in actions:
+        cmd += ["-A", f"{key}={label}"]
+    if actions:
+        cmd.append("--wait")
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+
+
+def clean_title(caption, stream):
+    t = caption or ""
+    t = re.sub(r"^\(\d+\)\s*", "", t)                                    # unread badge "(1) "
+    t = re.sub(r"^(Calendar|Chat|Activity|Meeting|Call)\s*\|\s*", "", t)  # Teams view prefix
+    t = re.sub(r"\s*[|\-–]\s*(Microsoft Teams|Zoom( Workplace)?|Google Chrome|Brave|Mozilla Firefox|Chromium)\s*$",
+               "", t)
+    t = t.strip() or f"{stream['app']} meeting"
+    prof = profile_name(stream["pid"]) if stream.get("pid") else None
+    return f"{prof} - {t}" if prof and prof not in t else t
+
+
+def safe_name(s):
+    return re.sub(r"[^\w .,()&+-]", "_", s).strip()[:80]
+
+
+def expand(command, **values):
+    """Fill {folder} {audio} {video} {json} {title} placeholders, shell-quoted."""
+    return command.format(**{k: shlex.quote(str(v)) for k, v in values.items()})
+
+
+# ---- recording ----------------------------------------------------------------------------
+class Recording:
+    """One meeting: continuous audio (ffmpeg → .mka) + video pieces, one per screen.
+
+    Changing the screen starts a new video piece; the old one stops once the new one has
+    its first frame. `finalize` (its own systemd unit, so it survives service restarts)
+    writes the .m4a/.json right away and then joins the video pieces."""
+
+    def __init__(self, stream, monitor, caption, switched=False):
+        self.stream = stream
+        self.index = stream.get("index")
+        self.manual = stream.get("manual", False)
+        self.monitor = monitor
+        self.title = clean_title(caption, stream)
+        self.start = datetime.now()
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        self.base = f"{self.start:%Y-%m-%d_%H%M} {safe_name(self.title)}"
+        self.folder = OUT_DIR / self.base
+        self.segdir = self.folder / ".segments"
+        self.segdir.mkdir(parents=True, exist_ok=True)
+        self.notes = self.folder / f".{self.base}.notes.jsonl"
+        self.log = open(OUT_DIR / ".recorder.log", "a")
+        self.audio_raw = self.segdir / "audio.mka"
+        acmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "pulse", "-wallclock", "1", "-i", output_monitor_for(stream["binary"]),
+                "-f", "pulse", "-wallclock", "1", "-i", stream["mic"],
+                "-filter_complex", "amix=inputs=2:duration=longest:normalize=0",
+                "-copyts", "-c:a", "aac", "-b:a", "128k", str(self.audio_raw)]
+        log("audio:", " ".join(acmd))
+        self.aproc = subprocess.Popen(acmd, stdin=subprocess.PIPE, stdout=self.log, stderr=self.log)
+        self.segments = []
+        self.retiring = None
+        self.new_segment(monitor)
+        self.write_manifest()
+        self.write_state()
+        if switched:
+            DISCARD_FILE.unlink(missing_ok=True)
+            self.switch_note()
+        else:
+            notify("Recording meeting", f"{self.title}\nScreen: {screen_label(self.monitor)}\n"
+                   "Click the tray icon for notes.", timeout=6)
+
+    # video pieces
+    def new_segment(self, monitor):
+        seg = self.segdir / f"video-{len(self.segments):02d}.mp4"
+        cmd = ["gpu-screen-recorder", "-w", monitor, "-f", FPS, "-c", "mp4", "-k", "h264",
+               "-q", CFG["quality"], "-cursor", "yes", "-write-first-frame-ts", "yes", "-o", str(seg)]
+        log("video:", " ".join(cmd))
+        proc = subprocess.Popen(cmd, stdout=self.log, stderr=self.log)
+        self.segments.append({"file": str(seg), "screen": monitor, "proc": proc})
+        self.monitor = monitor
+
+    def change_screen(self, monitor):
+        if monitor == self.monitor:
+            return
+        if self.retiring:
+            self.stop_proc(self.retiring["proc"])
+        self.retiring = self.segments[-1]
+        self.new_segment(monitor)
+        self.write_manifest()
+        self.write_state()
+        log("screen ->", monitor)
+        notify("Recording screen changed", f"Now recording: {screen_label(monitor)}", timeout=4,
+               icon="video-display")
+
+    def tick(self):
+        """Stop the retiring piece once the new piece has its first frame (or after 5 s)."""
+        if not self.retiring:
+            return
+        ts = Path(self.segments[-1]["file"] + ".ts")
+        started = self.segments[-1].setdefault("t0", time.time())
+        if ts.exists() or time.time() - started > 5:
+            self.stop_proc(self.retiring["proc"])
+            self.retiring = None
+
+    def alive(self):
+        return self.aproc.poll() is None and self.segments[-1]["proc"].poll() is None
+
+    @staticmethod
+    def stop_proc(proc, sig=signal.SIGINT):
+        if proc.poll() is None:
+            proc.send_signal(sig)
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def stop_all(self):
+        for seg in self.segments:
+            self.stop_proc(seg["proc"])
+        if self.aproc.poll() is None:
+            try:
+                self.aproc.stdin.write(b"q")        # ffmpeg: finish the file cleanly
+                self.aproc.stdin.flush()
+            except OSError:
+                pass
+            try:
+                self.aproc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.stop_proc(self.aproc)
+
+    # bookkeeping
+    def write_manifest(self):
+        (self.segdir / "manifest.json").write_text(json.dumps({
+            "title": self.title, "app": self.stream["app"], "start": self.start.isoformat(),
+            "base": self.base, "audio": str(self.audio_raw), "notes": str(self.notes),
+            "segments": [{"file": s["file"], "screen": s["screen"]} for s in self.segments]}, indent=1))
+
+    def write_state(self):
+        STATE_FILE.write_text(json.dumps({"title": self.title, "start": self.start.isoformat(),
+                                          "notes": str(self.notes), "stop_file": str(STOP_FILE),
+                                          "folder": str(OUT_DIR), "screen": self.monitor}))
+
+    def switch_note(self):
+        scr = [(n, l) for n, l in screens()[:3] if n != self.monitor]
+        n = notify("Recording next meeting", f"{self.title}\nScreen: {screen_label(self.monitor)}\n"
+                   "The previous meeting was saved.",
+                   actions=[("skip", "Skip (delete)")] + [(f"screen:{k}", l) for k, l in scr], timeout=15)
+
+        def act():
+            out = (n.communicate()[0] or "").strip()
+            if out == "skip":
+                DISCARD_FILE.touch()
+            elif out.startswith("screen:"):
+                SCREEN_FILE.write_text(out[7:])
+        threading.Thread(target=act, daemon=True).start()
+
+    def owns_state(self):
+        try:
+            return json.loads(STATE_FILE.read_text()).get("notes") == str(self.notes)
+        except (OSError, ValueError):
+            return False
+
+    def discard(self):
+        self.stop_all()
+        if self.owns_state():
+            STATE_FILE.unlink(missing_ok=True)
+        shutil.rmtree(self.folder, ignore_errors=True)
+        log("discarded (skipped):", self.title)
+
+    def stop(self):
+        if self.owns_state():
+            FLUSH_FLAG.touch()
+            for _ in range(20):
+                if not FLUSH_FLAG.exists():
+                    break
+                time.sleep(0.1)
+            FLUSH_FLAG.unlink(missing_ok=True)
+            STATE_FILE.unlink(missing_ok=True)
+        else:
+            time.sleep(1)                    # a newer recording took over; the tray flushed us on the switch
+        self.stop_all()
+        secs = int((datetime.now() - self.start).total_seconds())
+        if secs < CFG["min_length"]:
+            log(f"discarded ({secs}s)")
+            shutil.rmtree(self.folder, ignore_errors=True)
+            return
+        spawn_finalize(self.folder)
+
+
+# ---- finishing a recording ----------------------------------------------------------------
+def spawn_finalize(folder):
+    """Run `finalize` as a transient systemd unit, so restarting the service can't kill it."""
+    logf = str(OUT_DIR / ".recorder.log")
+    subprocess.Popen(["systemd-run", "--user", "--collect", "--quiet", "--nice=10",
+                      f"--unit=meeting-finalize-{int(time.time() * 1000)}",
+                      f"--property=StandardOutput=append:{logf}", f"--property=StandardError=append:{logf}",
+                      SELF, "finalize", str(folder)])
+
+
+def first_frame(seg):
+    """Wall-clock time (s) of a video piece's first frame, from gpu-screen-recorder's .ts file."""
+    try:
+        return int(Path(seg + ".ts").read_text().split()[-1]) / 1e6
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def probe(path, entry):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", f"format={entry}", "-of", "csv=p=0", path],
+                       capture_output=True, text=True)
+    try:
+        return float(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def finalize(folder):
+    folder = Path(folder)
+    segdir = folder / ".segments"
+    lock = segdir / ".finalizing"
+    try:
+        pid = int(lock.read_text())
+        os.kill(pid, 0)
+        log("already being finished by pid", pid, folder.name)
+        return
+    except (OSError, ValueError):
+        pass
+    lock.write_text(str(os.getpid()))
+    man = json.loads((segdir / "manifest.json").read_text())
+    base, audio_raw = man["base"], man["audio"]
+    audio, video, meta_file = folder / f"{base}.m4a", folder / f"{base}.mp4", folder / f"{base}.json"
+    a0 = probe(audio_raw, "start_time")
+    # 1. audio + metadata first, so actions can run while the video is still being joined
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", audio_raw,
+                    "-c:a", "copy", "-movflags", "+faststart", str(audio)], check=True)
+    secs = int(probe(str(audio), "duration") or 0)
+    notes, npath = [], Path(man["notes"])
+    if npath.exists():
+        notes = [json.loads(l) for l in npath.read_text().splitlines() if l.strip()]
+    meta = {"title": man["title"], "app": man["app"], "start": man["start"], "duration": secs,
+            "folder": str(folder), "video": str(video), "audio": str(audio),
+            "screens": [s["screen"] for s in man["segments"]], "notes": notes}
+    if meta_file.exists():                   # keep fields other tools added on an earlier run
+        old = json.loads(meta_file.read_text())
+        meta = {**old, **meta}
+    meta_file.write_text(json.dumps(meta, indent=2))
+    npath.unlink(missing_ok=True)
+    log("saved", audio, f"{secs}s")
+    values = dict(folder=folder, audio=audio, video=video, json=meta_file, title=man["title"])
+    if CFG["on_saved"]:
+        subprocess.Popen(expand(CFG["on_saved"], **values), shell=True, start_new_session=True)
+    actions = [("open", "Open folder")] + [(f"act:{i}", a["label"]) for i, a in enumerate(CFG["actions"][:2])]
+    n = len(notes)
+    p = notify("Meeting saved", f"{man['title']} ({secs // 60} min, {n} note{'s' * (n != 1)})"
+               + ("\nJoining the video from several screens…" if len(man["segments"]) > 1 else ""),
+               actions=actions, timeout=20, icon="media-playback-stop")
+
+    def on_action():
+        act = (p.communicate()[0] or "").strip()
+        if act == "open":
+            subprocess.Popen(["xdg-open", str(folder)])
+        elif act.startswith("act:"):
+            subprocess.Popen(expand(CFG["actions"][int(act[4:])]["command"], **values), shell=True,
+                             start_new_session=True)
+    threading.Thread(target=on_action).start()
+
+    # 2. video: one piece = copy; several = scale each onto join_size and join
+    segs = [s for s in man["segments"] if Path(s["file"]).exists() and Path(s["file"]).stat().st_size > 0]
+    if not segs:
+        log("no video pieces for", folder)
+        lock.unlink(missing_ok=True)
+        return
+    starts = [first_frame(s["file"]) for s in segs]
+    offset = max(0.0, (starts[0] or a0 or 0) - (a0 or starts[0] or 0))
+    tmp = video.with_suffix(".joining.mp4")
+    if len(segs) == 1:
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+               "-itsoffset", f"{offset:.3f}", "-i", segs[0]["file"], "-i", str(audio),
+               "-map", "0:v", "-map", "1:a", "-c", "copy", "-movflags", "+faststart", str(tmp)]
+    else:
+        w, h = CFG["join_size"].split("x")
+        cmd = ["nice", "-n", "15", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+        chains = []
+        for i, sg in enumerate(segs):
+            cmd += ["-i", sg["file"]]
+            dur = ""
+            if i + 1 < len(segs) and starts[i] and starts[i + 1]:
+                dur = f"trim=duration={starts[i + 1] - starts[i]:.3f},"
+            chains.append(f"[{i}:v]{dur}setpts=PTS-STARTPTS,scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                          f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={FPS}[v{i}]")
+        cmd += ["-i", str(audio)]
+        graph = ";".join(chains) + ";" + "".join(f"[v{i}]" for i in range(len(segs))) + \
+            f"concat=n={len(segs)}:v=1:a=0[cat];[cat]tpad=start_duration={offset:.3f}:color=black[v]"
+        cmd += ["-filter_complex", graph, "-map", "[v]", "-map", f"{len(segs)}:a",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-c:a", "copy",
+                "-movflags", "+faststart", str(tmp)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not tmp.exists():
+        log("video join failed, pieces kept in", segdir, r.stderr[-400:])
+        tmp.unlink(missing_ok=True)
+        notify("Meeting video not joined", f"{man['title']}\nThe audio is fine; the video pieces were kept.",
+               icon="dialog-warning")
+        lock.unlink(missing_ok=True)
+        return
+    tmp.replace(video)
+    shutil.rmtree(segdir, ignore_errors=True)
+    log("video done", video, f"{len(segs)} piece(s)")
+    if len(segs) > 1:
+        notify("Meeting video ready", f"{man['title']}\nJoined {len(segs)} screen recordings.",
+               icon="video-x-generic", timeout=8)
+
+
+def finalize_leftovers():
+    """Recordings interrupted by a crash/restart: pieces but no finished video."""
+    for man in OUT_DIR.glob("*/.segments/manifest.json"):
+        spawn_finalize(man.parent.parent)
+        log("finishing leftover recording:", man.parent.parent.name)
+
+
+# ---- start-of-meeting prompt ----------------------------------------------------------------
+def countdown(stream, default_screen):
+    """Notification with Skip + one button per screen. Returns the screen to record, or None."""
+    scr = screens()[:3] or [(default_screen, default_screen)]
+    names = [n for n, _ in scr]
+    if default_screen not in names:
+        default_screen = names[0]
+    label = dict(scr)[default_screen]
+    secs = CFG["countdown"]
+    n = notify(f"Meeting detected — {stream['app']}",
+               f"Recording {label} (where the meeting is) in {secs}s.\nClick a screen to pick another.",
+               actions=[("skip", "Skip")] + [(f"screen:{n}", l) for n, l in scr], timeout=secs)
+    try:
+        out, _ = n.communicate(timeout=secs + 1)
+    except subprocess.TimeoutExpired:
+        n.terminate()
+        out = ""
+    out = (out or "").strip()
+    log("countdown result:", repr(out))
+    if out == "skip":
+        return None
+    if out.startswith("screen:") and out[7:] in names:
+        return out[7:]
+    return default_screen
+
+
+# ---- main loop ------------------------------------------------------------------------------
+def main():
+    cmd = sys.argv[1:]
+    if cmd == ["stop"]:
+        STOP_FILE.touch()
+        return
+    if cmd == ["start"]:
+        START_FILE.touch()
+        return
+    if cmd == ["notes"]:
+        if STATE_FILE.exists():
+            NOTES_FLAG.touch()
+        else:
+            notify("Not recording", "Start a recording first, then add notes.")
+        return
+    if cmd[:1] == ["screen"] and len(cmd) == 2:
+        if STATE_FILE.exists():
+            SCREEN_FILE.write_text(cmd[1])
+        else:
+            notify("Not recording", "Start a recording first.")
+        return
+    if cmd[:1] == ["finalize"] and len(cmd) == 2:
+        finalize(cmd[1])
+        return
+    if cmd:
+        sys.exit(__doc__)
+
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    for f in (STOP_FILE, START_FILE, SCREEN_FILE):
+        f.unlink(missing_ok=True)
+    rec, skipped, mine_seen = None, set(), 0.0
+    log("watching for meetings")
+    finalize_leftovers()
+
+    def stop_in_background(old):
+        threading.Thread(target=old.stop, daemon=True).start()
+
+    try:
+        while True:
+            streams = find_meeting_streams()
+            now = time.time()
+            live = {s["index"] for s in streams}
+            skipped &= live                          # forget skipped meetings once they end
+            fresh = [s for s in streams if s["index"] not in skipped and (not rec or s["index"] != rec.index)]
+
+            if rec and not rec.manual:
+                if rec.index in live:
+                    mine_seen = now
+                else:
+                    # Same meeting on a new stream (e.g. mic changed): same process, same window title.
+                    same = None
+                    for s in fresh:
+                        if s["pid"] and s["pid"] == rec.stream.get("pid"):
+                            if clean_title(meeting_window(s)[1], s) == rec.title:
+                                same = s
+                                break
+                    if same:
+                        log("same meeting, new stream:", same)
+                        rec.index, mine_seen = same["index"], now
+                    elif fresh:
+                        # Jumped straight into another meeting: start it now, save the old one behind it.
+                        s = fresh[0]
+                        log("switched to another meeting:", s)
+                        old = rec
+                        monitor, caption = meeting_window(s)
+                        rec, mine_seen = Recording(s, monitor, caption, switched=True), now
+                        stop_in_background(old)
+                    elif now - mine_seen > CFG["end_grace"]:
+                        rec.stop()
+                        rec = None
+            elif not rec and fresh:
+                s = fresh[0]
+                log("meeting detected:", s)
+                monitor, caption = meeting_window(s)
+                chosen = countdown(s, monitor)
+                if chosen and s["index"] in {x["index"] for x in find_meeting_streams()}:
+                    rec, mine_seen = Recording(s, chosen, caption), time.time()
+                else:
+                    log("not recording this meeting")
+                    skipped.add(s["index"])
+
+            if START_FILE.exists():
+                START_FILE.unlink(missing_ok=True)
+                if rec:
+                    notify("Already recording", rec.title, timeout=4)
+                else:
+                    s2 = fresh[0] if fresh else (streams[0] if streams else manual_stream())
+                    monitor, caption = (meeting_window(s2) if not s2.get("manual")
+                                        else (active_screen(), "Manual recording"))
+                    log("manual start:", s2)
+                    rec, mine_seen = Recording(s2, monitor, caption), time.time()
+                    skipped.discard(s2.get("index"))
+            if rec and DISCARD_FILE.exists():
+                DISCARD_FILE.unlink(missing_ok=True)
+                rec.discard()
+                skipped.add(rec.index)
+                rec = None
+            if rec and SCREEN_FILE.exists():
+                want = SCREEN_FILE.read_text().strip()
+                SCREEN_FILE.unlink(missing_ok=True)
+                names = [n for n, _ in screens()]
+                if want == "next" and names:
+                    want = names[(names.index(rec.monitor) + 1) % len(names)] if rec.monitor in names else names[0]
+                if want in names:
+                    rec.change_screen(want)
+            if rec:
+                rec.tick()
+            if rec and (STOP_FILE.exists() or not rec.alive()):
+                STOP_FILE.unlink(missing_ok=True)
+                rec.stop()
+                if rec.index is not None:
+                    skipped.add(rec.index)
+                rec = None
+            time.sleep(POLL)
+    finally:
+        if rec:
+            rec.stop()
+
+
+if __name__ == "__main__":
+    main()
