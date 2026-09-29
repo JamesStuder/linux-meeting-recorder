@@ -291,6 +291,14 @@ def safe_name(s):
     return re.sub(r"[^\w .,()&+-]", "_", s).strip()[:80]
 
 
+def detach(argv):
+    """Start argv in its own transient systemd user unit. finalize runs as a transient unit
+    too, and systemd kills whatever it started when it exits, so a plain child (an upload
+    started from the notification, the file manager) would die with it."""
+    subprocess.run(["systemd-run", "--user", "--collect", "--quiet", "--"] + argv,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def expand(command, **values):
     """Fill {folder} {audio} {video} {json} {title} placeholders, shell-quoted."""
     return command.format(**{k: shlex.quote(str(v)) for k, v in values.items()})
@@ -517,7 +525,7 @@ def finalize(folder):
     log("saved", audio, f"{secs}s")
     values = dict(folder=folder, audio=audio, video=video, json=meta_file, title=man["title"])
     if CFG["on_saved"]:
-        subprocess.Popen(expand(CFG["on_saved"], **values), shell=True, start_new_session=True)
+        detach(["sh", "-c", expand(CFG["on_saved"], **values)])
     actions = [("open", "Open folder")] + [(f"act:{i}", a["label"]) for i, a in enumerate(CFG["actions"][:2])]
     n = len(notes)
     p = notify("Meeting saved", f"{man['title']} ({secs // 60} min, {n} note{'s' * (n != 1)})"
@@ -527,10 +535,9 @@ def finalize(folder):
     def on_action():
         act = (p.communicate()[0] or "").strip()
         if act == "open":
-            subprocess.Popen(["xdg-open", str(folder)])
+            detach(["xdg-open", str(folder)])
         elif act.startswith("act:"):
-            subprocess.Popen(expand(CFG["actions"][int(act[4:])]["command"], **values), shell=True,
-                             start_new_session=True)
+            detach(["sh", "-c", expand(CFG["actions"][int(act[4:])]["command"], **values)])
     threading.Thread(target=on_action).start()
 
     # 2. video: one piece = copy; several = scale each onto join_size and join
