@@ -4,6 +4,8 @@
 output_dir = "~/Videos/Meetings"
 countdown = 10          # seconds to Skip / pick a screen when a meeting starts
 end_grace = 5           # the meeting's mic stream has been gone this long = meeting over
+join_settle = 180       # for this many seconds after a recording starts, a new mic stream from the
+                        # same app counts as the same meeting (Teams reconnects while joining)
 min_length = 60         # shorter recordings are deleted (mic tests, accidental starts)
 fps = 15
 quality = "medium"      # gpu-screen-recorder quality: medium, high, very_high, ultra

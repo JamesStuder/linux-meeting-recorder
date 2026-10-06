@@ -33,6 +33,7 @@ DEFAULTS = {
     "output_dir": "~/Videos/Meetings",
     "countdown": 10,          # seconds to click Skip / pick a screen when a meeting starts
     "end_grace": 5,           # meeting's mic stream gone this long = meeting over
+    "join_settle": 180,       # first seconds of a recording: a new stream from the same app process = same meeting
     "min_length": 60,         # shorter recordings are deleted (mic tests etc.)
     "fps": 15,
     "quality": "medium",      # gpu-screen-recorder -q
@@ -281,7 +282,7 @@ def notify(summary, body, actions=(), timeout=None, icon="media-record"):
 def clean_title(caption, stream):
     t = caption or ""
     t = re.sub(r"^\(\d+\)\s*", "", t)                                    # unread badge "(1) "
-    t = re.sub(r"^(Calendar|Chat|Activity|Meeting|Call)\s*\|\s*", "", t)  # Teams view prefix
+    t = re.sub(r"^(Calendar|Chat|Activity|Meeting|Call)\b[^|]{0,30}\|\s*", "", t)  # Teams view prefix ("Meeting join | ", "Meeting compact view | ")
     t = re.sub(r"\s*[|\-–]\s*(Microsoft Teams|Zoom( Workplace)?|Google Chrome|Brave|Mozilla Firefox|Chromium)\s*$",
                "", t)
     t = t.strip() or f"{stream['app']} meeting"
@@ -671,10 +672,14 @@ def main():
                     mine_seen = now
                 else:
                     # Same meeting on a new stream (e.g. mic changed): same process, same window title.
+                    # While joining, Teams re-creates its mic stream several times and the window
+                    # title flips (join screen, channel view, compact view), so early on the same
+                    # process is enough.
                     same = None
+                    joining = now - rec.start.timestamp() < CFG["join_settle"]
                     for s in fresh:
                         if s["pid"] and s["pid"] == rec.stream.get("pid"):
-                            if clean_title(meeting_window(s)[1], s) == rec.title:
+                            if joining or clean_title(meeting_window(s)[1], s) == rec.title:
                                 same = s
                                 break
                     if same:

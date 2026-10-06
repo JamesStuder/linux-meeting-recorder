@@ -24,8 +24,8 @@ features (see [Requirements](#requirements)).
 - **Notes with timestamps** — a small always-on-top window; each note is stamped with
   the moment you *started typing* it and its offset into the recording, so it lines
   up with what was said.
-- **Tray icon** — grey when idle (click to start a recording), red while recording
-  (click for notes; menu for Stop, Screen, Open folder).
+- **Tray icon** — grey dot when idle, red dot while recording. Left or right click opens
+  the menu (Start; or Notes, Stop, Screen, Open folder while recording).
 - **One folder per recording** with `<name>.mp4` (video + audio), `<name>.m4a`
   (audio only — handy for transcription services) and `<name>.json` (title,
   duration, screens, notes).

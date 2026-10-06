@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """meeting-recorder-tray: always-on tray icon + notes window for meeting-recorder.
 
-Idle: grey record icon; click = start recording, menu = Start / Open recordings folder.
-Recording: red icon; click = notes window, menu = Notes / Stop / Open folder.
+Idle: grey dot; click or right-click = menu (Start / Open recordings folder).
+Recording: red dot; click or right-click = menu (Notes / Stop / Screen / Open folder).
 
 The recorder writes a state file while recording:
   {"title", "start" (ISO time), "notes" (jsonl path), "stop_file", "folder"}
@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QAction, QIcon, QKeyEvent
+from PyQt6.QtGui import QAction, QColor, QCursor, QIcon, QKeyEvent, QPainter, QPixmap
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QHBoxLayout, QLabel, QListWidget,
                              QMenu, QPlainTextEdit, QPushButton, QSystemTrayIcon,
                              QVBoxLayout, QWidget)
@@ -64,6 +64,19 @@ def screens():
         used.add(label)
         res.append((name, label))
     return res
+
+
+def dot_icon(color):
+    """Own circle icon: icon themes often ship a monochrome media-record, which never shows red."""
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(color))
+    p.drawEllipse(8, 8, 48, 48)
+    p.end()
+    return QIcon(pm)
 
 
 def fmt(secs):
@@ -173,9 +186,8 @@ class Tray:
         self.win = None
         self.state_mtime = None
         self.screen_list = []
-        red = QIcon.fromTheme("media-record")
-        self.icon_rec = red
-        self.icon_idle = QIcon(red.pixmap(64, QIcon.Mode.Disabled))
+        self.icon_rec = dot_icon("#e53935")
+        self.icon_idle = dot_icon("#8a8f98")
         self.tray = QSystemTrayIcon(self.icon_idle)
         self.menu = QMenu()
         self.tray.setContextMenu(self.menu)
@@ -211,10 +223,7 @@ class Tray:
     def clicked(self, reason):
         if reason != QSystemTrayIcon.ActivationReason.Trigger:
             return
-        if self.recording():
-            self.win.toggle()
-        else:
-            START_FILE.touch()
+        self.menu.popup(QCursor.pos())           # left click = same menu as right click
 
     def begin(self, state):
         self.screen_list = screens()
@@ -265,10 +274,10 @@ class Tray:
                 self.win.open()
         if self.win:
             stamp, _ = self.win.elapsed()
-            self.tray.setToolTip(f"Recording {stamp}\n{self.win.state['title']}\nClick for notes")
+            self.tray.setToolTip(f"Recording {stamp}\n{self.win.state['title']}\nClick for menu")
             self.win.clock.setText(f"● Recording  {stamp}   —   notes: {self.win.list.count()}")
         else:
-            self.tray.setToolTip("Meeting Recorder — not recording\nClick to start recording, right-click for menu")
+            self.tray.setToolTip("Meeting Recorder — not recording\nClick for menu")
 
 
 def main():
